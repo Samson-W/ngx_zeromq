@@ -145,7 +145,7 @@ ngx_zeromq_randomized_endpoint(ngx_zeromq_endpoint_t *zep, ngx_pool_t *pool)
     }
 
     ngx_memcpy(rand, zep, sizeof(ngx_zeromq_endpoint_t));
-
+	//新的端点结构中包括了端口号的长度，但是下句拷贝时只拷贝了不包括端口号的长度
     rand->addr.data = ngx_pnalloc(pool, zep->addr.len + sizeof("65535"));
     ngx_memcpy(rand->addr.data, zep->addr.data, zep->addr.len);
 
@@ -160,7 +160,7 @@ ngx_zeromq_randomized_endpoint_regen(ngx_str_t *addr)
     u_char     *p;
 
     p = addr->data + addr->len;
-
+	//反推出端口号的起始地址
     while (p > addr->data) {
         if (*p == ':') {
             break;
@@ -168,9 +168,9 @@ ngx_zeromq_randomized_endpoint_regen(ngx_str_t *addr)
 
         p--;
     }
-
+	//随机生成端口号
     port = 1024 + ngx_pid + ngx_random();
-
+	//得到现在的地址长度
     addr->len = ngx_snprintf(p + 1, sizeof("65535") - 1, "%d", port)
                 - addr->data;
     addr->data[addr->len] = '\0';
@@ -225,10 +225,14 @@ ngx_zeromq_headers_set_http(ngx_buf_t *b, ngx_zeromq_endpoint_t *zep)
                            &zep->type->name, &zep->addr);
 }
 
-
+//zmq_skt: 当查找到可重用的0MQ连接时，此值不为NULL
+//zmq_fd: 当有可重用的0MQ连接时，此值不为0
+//当没有查找到可重用的0MQ连接时，zmq_skt和zmq_fd都为NULL
+//表示得到的可重用的0MQ连接项，若为NULL则表示没有可重用的，使用原来的方法进行创建
 ngx_int_t
-ngx_zeromq_connect(ngx_peer_connection_t *pc)
-{
+ngx_zeromq_connect(ngx_peer_connection_t *pc, void *zmq_skt, int zmq_fd)
+{	
+	//对应的是send端点ngx_zeromq_connection_t
     ngx_zeromq_connection_t  *zc = pc->data;
     ngx_zeromq_endpoint_t    *zep;
     ngx_connection_t         *c;
@@ -237,9 +241,22 @@ ngx_zeromq_connect(ngx_peer_connection_t *pc)
     int                       fd, zero;
     size_t                    fdsize;
     ngx_uint_t                i;
-
+	//是否使用的重用的0MQ连接
+	int 					  isreuse = 0;
+	//得到此模块的端点的网络连接的结构
     zep = zc->endpoint;
+	zero = 0;
 
+	//使用可重用的0MQ连接，直接跳过创建0MQ连接的过程
+	if (zmq_skt != NULL && zmq_fd != 0){
+		fd = zmq_fd;
+		zmq = zmq_skt;
+		isreuse = 1;
+		ngx_log_error(NGX_LOG_ALERT, pc->log, 0, "-----yygy re used zmq_skt is %p zmq_fd is %d", zmq_skt, zmq_fd);
+		goto zmq_cached;
+	}
+
+	//创建0MQ套接字
     zmq = zmq_socket(ngx_zeromq_ctx, zep->type->value);
     if (zmq == NULL) {
         ngx_log_error(NGX_LOG_ALERT, pc->log, 0,
@@ -249,55 +266,60 @@ ngx_zeromq_connect(ngx_peer_connection_t *pc)
     }
 
     fdsize = sizeof(int);
-
+	//Retrieve file descriptor associated with the socket
     if (zmq_getsockopt(zmq, ZMQ_FD, &fd, &fdsize) == -1) {
         ngx_zeromq_log_error(pc->log, "zmq_getsockopt(ZMQ_FD)");
         goto failed_zmq;
     }
+	
+	ngx_log_error(NGX_LOG_DEBUG, pc->log, 0, "zmp_getsockopt fd is %d", fd);
 
-    zero = 0;
-
+	//得到socket shutdown的处理机制
     if (zmq_setsockopt(zmq, ZMQ_LINGER, &zero, sizeof(int)) == -1) {
         ngx_zeromq_log_error(pc->log, "zmq_setsockopt(ZMQ_LINGER)");
         goto failed_zmq;
     }
 
+zmq_cached:
+	//得到一个空闲连接上下文 
     c = ngx_get_connection(fd, pc->log);
     if (c == NULL) {
         goto failed_zmq;
     }
-
+	//配置连接的事件响应等回调方法
     c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
-
+	//直接接收网络字符流的方法
     c->recv = ngx_zeromq_recv;
     c->send = NULL;
+	//以ngx_chain_t链表为参数来接收网络字符流的方法
     c->recv_chain = ngx_zeromq_recv_chain;
+	//以ngx_chain_t链表为参数来发送网络字符流的方法
     c->send_chain = ngx_zeromq_send_chain;
 
     /* This won't fly with ZeroMQ */
     c->sendfile = 0;
     c->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
     c->tcp_nodelay = NGX_TCP_NODELAY_DISABLED;
-
+	//日志记录的级别
     c->log_error = pc->log_error;
-
+	//得到初始的读写事件结构地址
     rev = c->read;
     wev = c->write;
-
+	//设置读写事件结构中的数据为ngx_zeromq_connection_t结构
     rev->data = zc;
     wev->data = zc;
-
+	//设置读写事件的回调方法
     rev->handler = ngx_zeromq_event_handler;
     wev->handler = ngx_zeromq_event_handler;
 
     rev->log = pc->log;
     wev->log = pc->log;
-
+	//将0MQ的创建的连接保存到zc中
     pc->connection = &zc->connection;
     zc->connection_ptr = c;
 
     memcpy(&zc->connection, c, sizeof(ngx_connection_t));
-
+	//保存0MQ创建的套接字
     zc->socket = zmq;
 
     if (zep->type->can_send) {
@@ -313,9 +335,10 @@ ngx_zeromq_connect(ngx_peer_connection_t *pc)
                       "zmq_connect: binding to local address is not supported");
     }
 
-    if (zep->bind) {
+    if (zep->bind && !isreuse) {
         if (zep->rand) {
             for (i = 0; ; i++) {
+				//随机生成端口
                 ngx_zeromq_randomized_endpoint_regen(&zep->addr);
 
                 if (zmq_bind(zmq, (const char *) zep->addr.data) == -1) {
@@ -337,8 +360,9 @@ ngx_zeromq_connect(ngx_peer_connection_t *pc)
                 goto failed;
             }
         }
-
-    } else {
+	//为REQ时，为客户端，对远程进行连接；若使用的是重用0MQ连接，则不再进行connect操作，否则进行connect操作
+    } else if (!isreuse) {
+			ngx_zeromq_log_error(pc->log, "-----yygy zmq_connect() is not reuse ");
         if (zmq_connect(zmq, (const char *) zep->addr.data) == -1) {
             ngx_zeromq_log_error(pc->log, "zmq_connect()");
             goto failed;
@@ -346,10 +370,10 @@ ngx_zeromq_connect(ngx_peer_connection_t *pc)
     }
 
     ngx_log_debug7(NGX_LOG_DEBUG_EVENT, pc->log, 0,
-                   "zmq_connect: %s to %V (%V), fd:%d #%d zc:%p zmq:%p",
+                   "-----yygy zmq_connect: %s to %V (%V), fd:%d #%d zc:%p zmq:%p",
                    zep->bind ? "bound" : "lazily connected",
                    &zep->addr, &zep->type->name, fd, c->number, zc, zmq);
-
+	//将此连接添加到通知事件机制中，此处为epoll的机制管理中，调用ngx_epoll_add_connection
     if (ngx_add_conn) {
         /* rtsig */
         if (ngx_add_conn(c) == NGX_ERROR) {
@@ -376,7 +400,7 @@ ngx_zeromq_connect(ngx_peer_connection_t *pc)
      * and it won't notify us about any new events if we don't fail to read
      * from it first. Sigh.
      */
-
+	//为1时表示当前事件已经准备就绪
     rev->ready = 1;
     wev->ready = zep->type->can_send;
 
@@ -392,17 +416,18 @@ failed:
     zc->socket = NULL;
 
 failed_zmq:
-
-    if (zmq_close(zmq) == -1) {
-        ngx_zeromq_log_error(pc->log, "zmq_close()");
-    }
-
+	//如果不是重用的，新创建的话，那么在出错时则直接进行释放
+	if (!isreuse){
+    	if (zmq_close(zmq) == -1) {
+        	ngx_zeromq_log_error(pc->log, "-----yygy zmq_close()");
+    	}
+	}
     return NGX_ERROR;
 }
 
 
 void
-ngx_zeromq_close(ngx_zeromq_connection_t *zc)
+ngx_zeromq_close(ngx_zeromq_connection_t *zc, int flag)
 {
     ngx_connection_t  *c;
 
@@ -412,9 +437,9 @@ ngx_zeromq_close(ngx_zeromq_connection_t *zc)
         return;
     }
 
-    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
-                   "zmq_close: fd:%d #%d zc:%p zmq:%p",
-                   c->fd, c->number, zc, zc->socket);
+    ngx_log_debug5(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "------yygy zmq_close: fd:%d #%d zc:%p zmq:%p flag is %d",
+                   c->fd, c->number, zc, zc->socket, flag);
 
     if (c->read->timer_set) {
         ngx_del_timer(c->read);
@@ -425,7 +450,8 @@ ngx_zeromq_close(ngx_zeromq_connection_t *zc)
     }
 
     if (ngx_del_conn) {
-        ngx_del_conn(c, NGX_CLOSE_EVENT);
+        //ngx_del_conn(c, NGX_CLOSE_EVENT);
+        ngx_del_conn(c, NGX_FLUSH_EVENT);
 
     } else {
         if (c->read->active || c->read->disabled) {
@@ -462,10 +488,13 @@ ngx_zeromq_close(ngx_zeromq_connection_t *zc)
 
     c->fd = (ngx_socket_t) -1;
     zc->connection_ptr->fd = (ngx_socket_t) -1;
-
-    if (zmq_close(zc->socket) == -1) {
-        ngx_zeromq_log_error(ngx_cycle->log, "zmq_close()");
-    }
+	
+	//flag表示是否会进行添加到0MQ连接缓存中，若添加则为1,否则为0。如果添加到0MQ连接缓存中时，不进行0MQ连接的关闭操作
+	if (!flag) {
+    	if (zmq_close(zc->socket) == -1) {
+        	ngx_zeromq_log_error(ngx_cycle->log, "zmq_close()");
+    	}
+	}
 
     zc->socket = NULL;
 }
@@ -499,7 +528,7 @@ ngx_zeromq_event_handler(ngx_event_t *ev)
 #if (NGX_DEBUG)
     if (zc->recv != zc->send) {
         zmq = zc->request_sent ? zc->socket : zc->recv->socket;
-
+		// Retrieve socket event state
         if (zmq_getsockopt(zmq, ZMQ_EVENTS, &events, &esize) == -1) {
             ngx_zeromq_log_error(ev->log, "zmq_getsockopt(ZMQ_EVENTS)");
             ev->error = 1;
@@ -513,7 +542,7 @@ ngx_zeromq_event_handler(ngx_event_t *ev)
 #endif
 
     zmq = zc->request_sent ? zc->recv->socket : zc->socket;
-
+	// Retrieve socket event state
     if (zmq_getsockopt(zmq, ZMQ_EVENTS, &events, &esize) == -1) {
         ngx_zeromq_log_error(ev->log, "zmq_getsockopt(ZMQ_EVENTS)");
         ev->error = 1;
@@ -891,7 +920,7 @@ ngx_zeromq_threads(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+//模块初始化时调用
 static ngx_int_t
 ngx_zeromq_module_init(ngx_cycle_t *cycle)
 {
@@ -908,7 +937,7 @@ ngx_zeromq_module_init(ngx_cycle_t *cycle)
     return NGX_OK;
 }
 
-
+//进程初始化时创建zeromq
 static ngx_int_t
 ngx_zeromq_process_init(ngx_cycle_t *cycle)
 {
@@ -924,7 +953,7 @@ ngx_zeromq_process_init(ngx_cycle_t *cycle)
             ngx_zeromq_log_error(cycle->log, "zmq_ctx_new()");
             return NGX_ERROR;
         }
-
+		//设置zeromq处理IO操作的线程池的个数
         if (zmq_ctx_set(ngx_zeromq_ctx, ZMQ_IO_THREADS, zcf->threads) == -1) {
             ngx_zeromq_log_error(cycle->log, "zmq_ctx_set(ZMQ_IO_THREADS)");
         }

@@ -38,40 +38,51 @@
 #define NGX_ZEROMQ_PUSH  1
 #define NGX_ZEROMQ_PULL  2
 
-
 typedef struct ngx_zeromq_connection_s  ngx_zeromq_connection_t;
 
+//为zeromq支持几种模式，各种模式对应的值及能够处理的行为都是固定的
 typedef struct {
+	//模式名
     ngx_str_t                 name;
+	//此模式对应的值
     int                       value;
+	//是否能发送
     unsigned                  can_send:1;
+	//是否能接收 
     unsigned                  can_recv:1;
 } ngx_zeromq_socket_t;
 
 
 typedef struct {
+	//zeromq scoket的类型
     ngx_zeromq_socket_t      *type;
+	//zeromq socket的地址
     ngx_str_t                 addr;
+	//是否绑定端口
     unsigned                  bind:1;
+	//端口是否随机
     unsigned                  rand:1;
 } ngx_zeromq_endpoint_t;
 
 
 struct ngx_zeromq_connection_s {
+	//保存0MQ连接的fd的连接结构
     ngx_connection_t          connection;
+	//存放0MQ连接的fd的连接结构地址
     ngx_connection_t         *connection_ptr;
-
+	//端点信息
     ngx_zeromq_endpoint_t    *endpoint;
+	//0MQ创建的套接字
     void                     *socket;
 
     ngx_event_handler_pt      handler;
-
+	//保存send结构
     ngx_zeromq_connection_t  *send;
+	//保存recv结构
     ngx_zeromq_connection_t  *recv;
-
+	//请求是否已发送
     unsigned                  request_sent:1;
 };
-
 
 ngx_zeromq_endpoint_t *ngx_zeromq_randomized_endpoint(
     ngx_zeromq_endpoint_t *zep, ngx_pool_t *pool);
@@ -80,8 +91,8 @@ ngx_chain_t *ngx_zeromq_headers_add_http(ngx_chain_t *in,
     ngx_zeromq_endpoint_t *zep, ngx_pool_t *pool);
 void ngx_zeromq_headers_set_http(ngx_buf_t *b, ngx_zeromq_endpoint_t *zep);
 
-ngx_int_t ngx_zeromq_connect(ngx_peer_connection_t *pc);
-void ngx_zeromq_close(ngx_zeromq_connection_t *zc);
+ngx_int_t ngx_zeromq_connect(ngx_peer_connection_t *pc, void *zmq_skt, int zmq_fd);
+void ngx_zeromq_close(ngx_zeromq_connection_t *zc,  int flag);
 
 
 extern ngx_zeromq_socket_t  ngx_zeromq_socket_types[];
